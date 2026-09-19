@@ -1,3 +1,8 @@
+// Package main реализует терминал оператора — консольный интерфейс (TUI),
+// через который пользователь вводит команды, отправляет их на C2-сервер
+// по HTTP, ожидает результат и отображает его.
+// Терминал не общается с клиентом напрямую: он только взаимодействует
+// с C2-сервером через HTTP API.
 package main
 
 import (
@@ -16,8 +21,11 @@ import (
 	"c2project/shared"
 )
 
+// Адрес C2-сервера (HTTP API).
 const c2HTTP = "http://192.168.56.104:8080"
 
+// listClients запрашивает у C2 список зарегистрированных клиентов.
+// Возвращает срез ClientInfo (или nil при ошибке сети/декодирования).
 func listClients() []shared.ClientInfo {
 	resp, err := http.Get(c2HTTP + shared.EndpointList)
 	if err != nil {
@@ -30,6 +38,16 @@ func listClients() []shared.ClientInfo {
 	return list
 }
 
+// submitCommand отправляет команду на исполнение целевому клиенту.
+// Параметры:
+//   - clientID — идентификатор клиента, полученный из listClients;
+//   - command  — текстовая команда оператора (например, "ipconfig").
+//
+// Логика:
+//  1. Команда шифруется ключом KeyTerminalToC2 (первый слой шифрования).
+//  2. Полученный шифртекст кодируется в base64 и помещается в JSON.
+//  3. JSON отправляется методом POST на эндпоинт EndpointSubmit.
+//  4. Возвращается task_id, присвоенный задаче на C2.
 func submitCommand(clientID, command string) (string, error) {
 	encCommand, err := shared.Encrypt(shared.KeyTerminalToC2, []byte(command))
 	if err != nil {
@@ -54,6 +72,13 @@ func submitCommand(clientID, command string) (string, error) {
 	return sr.TaskID, nil
 }
 
+// pollStatus периодически опрашивает C2 о готовности результата задачи.
+// Параметр taskID — идентификатор задачи, полученный от submitCommand.
+// Цикл повторяется каждые 2 секунды, пока статус задачи не станет
+// StatusDone (результат готов) или StatusError.
+// Возвращает пару значений: итоговый статус и результат выполнения.
+// Полученный результат (base64) декодируется и расшифровывается
+// ключом KeyTerminalToC2 — это снимает первый слой шифрования.
 func pollStatus(taskID string) (string, string) {
 	for {
 		time.Sleep(2 * time.Second)
@@ -81,6 +106,9 @@ func pollStatus(taskID string) (string, string) {
 	}
 }
 
+// pickClient выводит список клиентов, полученный от C2, и запрашивает
+// у оператора номер нужного клиента. Возвращает строковый идентификатор
+// выбранного клиента (или пустую строку, если ввод некорректен/список пуст).
 func pickClient() string {
 	clients := listClients()
 	if len(clients) == 0 {
@@ -104,6 +132,15 @@ func pickClient() string {
 	return clients[idx-1].ClientID
 }
 
+// main — точка входа терминала оператора.
+// Устанавливает UTF-8 в консоли (для корректного вывода русских букв),
+// затем в цикле читает команды оператора:
+//   - "/exit"    — выход из программы;
+//   - "/clients" — выбрать клиента для работы;
+//   - любая другая строка — команда для отправки выбранному клиенту.
+//
+// После отправки команды терминал дожидается результата через pollStatus
+// и печатает его оператору.
 func main() {
 	setConsoleUTF8()
 	fmt.Println("=== C2 Terminal ===")
