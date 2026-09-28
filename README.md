@@ -60,20 +60,40 @@ c2-project/
 ├── go.sum
 ├── README.md
 ├── .gitignore
-├── cmd/
-│   ├── c2server/main.go       # точка входа C2-сервера (wiring + запуск)
-│   ├── client/main.go         # точка входа клиента-бэкдора
-│   └── terminal/main.go       # точка входа терминала оператора
-└── internal/
-    ├── agent/                 # клиент-бэкдор, выполнение команд, кодировка CP866
-    ├── crypto/                # AES-256-GCM + тесты
-    ├── httpapi/               # HTTP-сервер и хендлеры для терминала
-    ├── operator/              # TUI терминала, HTTP-клиент к C2
-    ├── packet/                # формат псевдо-SMB пакета + тесты
-    ├── protocol/              # ключи, эндпоинты, DTO
-    ├── service/               # бизнес-логика C2 + тесты
-    ├── storage/               # in-memory хранилище + тесты
-    └── tcpserver/             # TCP-сервер для клиентов (порт 445)
+├── cmd/                                # точки входа: только wiring и запуск
+│   ├── c2server/main.go                # собирает storage, service, httpapi, tcpserver; запускает через errgroup
+│   ├── client/main.go                  # читает конфиг, запускает agent с context
+│   └── terminal/main.go                # читает конфиг, запускает operator с context
+└── internal/                           # вся бизнес-логика
+    ├── agent/                          # клиент-бэкдор
+    │   ├── agent.go                    # подключение, регистрация, рандомизированный опрос задач
+    │   ├── executor.go                 # выполнение команд, захват STDOUT и STDERR
+    │   └── encoding.go                 # конвертация CP866 → UTF-8
+    ├── crypto/                         # слой криптографии
+    │   ├── crypto.go                   # AES-256-GCM, ошибки оборачиваются через %w
+    │   └── crypto_test.go              # unit-тесты: round-trip, wrong key, tampering
+    ├── httpapi/                        # HTTP-слой (приём запроса → валидация → сервис)
+    │   ├── handlers.go                 # хендлеры: принимают, валидируют, вызывают service; в storage не ходят
+    │   └── server.go                   # http.Server + graceful shutdown по context
+    ├── operator/                       # TUI оператора
+    │   ├── operator.go                 # цикл ввода-вывода
+    │   ├── client.go                   # HTTP-клиент к C2
+    │   ├── console_windows.go          # UTF-8 в консоли Windows
+    │   └── console_other.go            # заглушка для не-Windows
+    ├── packet/                         # формат псевдо-SMB пакета
+    │   ├── packet.go                   # SMB2-совместимый заголовок 64 байта, length-prefix
+    │   └── packet_test.go              # unit-тесты: сериализация, чтение по TCP, ошибки
+    ├── protocol/                       # общие константы и DTO
+    │   └── protocol.go                 # ключи, эндпоинты, JSON-структуры
+    ├── service/                        # слой бизнес-логики (без HTTP и storage-деталей)
+    │   ├── service.go                  # оркестрация: создание задач, шифрование, статусы
+    │   └── service_test.go             # unit-тесты: создание задачи, результат, статус
+    ├── storage/                        # слой данных (только работа с памятью)
+    │   ├── storage.go                  # клиенты, задачи, очереди; потокобезопасно через RWMutex
+    │   └── storage_test.go             # unit-тесты: upsert, очередь, pending-задачи
+    └── tcpserver/                      # TCP-слой для клиентов
+        ├── handler.go                  # обработка одного соединения: register → loop
+        └── server.go                   # Accept + WaitGroup + recover + graceful shutdown
 ```
 
 ## Сборка
